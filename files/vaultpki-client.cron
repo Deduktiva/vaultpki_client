@@ -1,0 +1,3 @@
+#!/bin/sh
+# THIS FILE IS MANAGED BY PUPPET. DO NOT EDIT.
+exec /usr/local/sbin/vaultpki-client --all

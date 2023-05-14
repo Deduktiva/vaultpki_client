@@ -1,0 +1,196 @@
+#!/usr/bin/python3
+# THIS FILE IS MANAGED BY PUPPET. DO NOT EDIT.
+import argparse
+import locale
+import json
+import os
+from pathlib import Path
+import subprocess
+import socket
+import sys
+import time
+import traceback
+
+locale.setlocale(locale.LC_ALL, "C.UTF-8")
+
+VAULT_ADDR = os.getenv("VAULT_ADDR") or "https://puppet:8200"
+MY_FQDN = socket.getfqdn()
+if os.geteuid() == 0:
+    CERTIFICATES_PATH = Path("/var/lib/vaultpki-client/certificates")
+    CA_CERT = "/etc/puppetlabs/puppet/ssl/certs/ca.pem"
+    CLIENT_CERT = "/etc/puppetlabs/puppet/ssl/certs/%s.pem" % MY_FQDN
+    CLIENT_KEY = "/etc/puppetlabs/puppet/ssl/private_keys/%s.pem" % MY_FQDN
+else:
+    CERTIFICATES_PATH = Path("~/.vaultpki-client/certificates").expanduser()
+    CA_CERT = Path("~/.vaultpki-client/auth/ca.pem").expanduser()
+    CLIENT_CERT = Path("~/.vaultpki-client/auth/cert.pem").expanduser()
+    CLIENT_KEY = Path("~/.vaultpki-client/auth/key.pem").expanduser()
+
+_vault_tokens = {}  # cached vault login tokens
+
+
+class VaultError(Exception):
+    """Vault has replied with an error message."""
+
+
+def curl_vault(urlpart, args):
+    """Talk to Vault using a curl subprocess."""
+    out = subprocess.check_output(
+        ["curl", "-s"] + args + ["%s/%s" % (VAULT_ADDR, urlpart)]
+    )
+    response = json.loads(out.decode("utf-8"))
+    if "errors" in response:
+        raise VaultError("Vault Error: %s" % (" ".join(response["errors"])))
+    return response
+
+
+def vault_token(auth_method: str) -> str:
+    """Login to vault and obtain a client token"""
+    global _vault_tokens
+    if _vault_tokens.get(auth_method) is None:
+        data = json.dumps({"name": auth_method})
+        response = curl_vault(
+            "v1/auth/cert/login",
+            [
+                "-XPOST",
+                "--cacert",
+                str(CA_CERT),
+                "--cert",
+                str(CLIENT_CERT),
+                "--key",
+                str(CLIENT_KEY),
+                "--data",
+                data,
+            ],
+        )
+        _vault_tokens[auth_method] = response["auth"]["client_token"]
+    return _vault_tokens[auth_method]
+
+
+def load_json(path: Path):
+    with path.open("rt") as fp:
+        return json.load(fp)
+
+
+def needs_refresh(metadata_data, stamp_json):
+    """Determine if a certificate needs refresh."""
+    if not stamp_json.exists():
+        return True
+    try:
+        stamp_data = load_json(stamp_json)
+        needs_renew = stamp_data["renew_after"] < time.time()
+        issuing_data_changed = stamp_data["metadata"]["issue"] != metadata_data["issue"]
+        return needs_renew or issuing_data_changed
+    except:
+        return True
+
+
+def replace_file(path: Path, mode, filemode=0o400, encoding=None):
+    """Opens a new file, removing it first if needed. Can be used to create with a specific mode."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+    flags = (
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    )  # Make open fail if someone else has created the file in the meantime
+    fd = os.open(str(path), flags, mode=filemode)
+    try:
+        return os.fdopen(fd, "w" + mode, encoding=encoding)
+    except:
+        os.close(fd)
+
+
+def refresh_cert(basedir: Path):
+    """Refresh certificate in basedir, if expired or missing."""
+    metadata_json = basedir / "metadata.json"
+    stamp_json = basedir / "stamp.json"
+
+    metadata_data = load_json(metadata_json)
+
+    if not needs_refresh(metadata_data, stamp_json):
+        return
+
+    client_token = vault_token(metadata_data["auth_method"])
+
+    # remove empty fields, which might require special settings if present.
+    if "ip_sans" in metadata_data["issue"] and metadata_data["issue"]["ip_sans"] == "":
+        del metadata_data["issue"]["ip_sans"]
+    if "alt_names" in metadata_data["issue"] and metadata_data["issue"]["alt_names"] == "":
+        del metadata_data["issue"]["alt_names"]
+
+    data = json.dumps(metadata_data["issue"])
+    request_time = int(time.time())
+    # TODO: make pki_int configurable
+    response = curl_vault(
+        "v1/pki_int/issue/%s" % metadata_data['pki_role'],
+        ["-XPOST", "--cacert", str(CA_CERT), "-H",
+         "X-Vault-Token: " + client_token, "--data", data],
+    )
+
+    # Should actually read the 'valid until' value from the certificate, but
+    # I hope this is a good enough approximation.
+    lifetime = request_time + metadata_data["issue"]["ttl"]
+    renew_after = request_time + (int(metadata_data["issue"]["ttl"] / 4) * 3)
+
+    # Write certbot-compatible files for consumers.
+    cert_file_keys = {
+        "ca.pem": ["issuing_ca"],
+        "cert.pem": ["certificate"],
+        "chain.pem": ["ca_chain"],
+        "fullchain.pem": ["certificate", "ca_chain"],
+        "fullchainandkey.pem": [
+            "private_key",
+            "certificate",
+            "ca_chain",
+        ],  # for nginx et al.
+        "privkey.pem": ["private_key"],
+    }
+    for (filename, data_keys) in cert_file_keys.items():
+        with replace_file(basedir / filename, "t") as fp:
+            for key in data_keys:
+                certs = response["data"][key]
+                if isinstance(certs, str):
+                    certs = [certs]
+                for cert in certs:
+                    fp.write(cert.strip() + "\n")
+
+    # Record state in the stamp file.
+    with replace_file(stamp_json, "t") as fp:
+        stamp_data = {
+            "lifetime": lifetime,
+            "metadata": metadata_data,  # used to determine issuing data changes.
+            "renew_after": renew_after,
+            "response": response,
+        }
+        json.dump(stamp_data, fp)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("name", nargs="*")
+    args = parser.parse_args()
+    failed = False
+    if args.all:
+        names = CERTIFICATES_PATH.glob("*/")
+    else:
+        names = [CERTIFICATES_PATH / name for name in args.name]
+
+    for name in names:
+        try:
+            refresh_cert(name)
+        except VaultError as except_inst:
+            print('Error with certificate "%s": %s' % (name, except_inst))
+            failed = True
+        except:
+            print('Error with certificate "%s":' % name)
+            traceback.print_exc()
+            failed = True
+    if failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
